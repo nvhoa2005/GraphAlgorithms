@@ -112,7 +112,21 @@ class MAPDCBSSolver(Solver):
     STUCK_LIMIT: int = 2
 
     def __init__(self, env: DeliveryEnv):
-        super().__init__(env)
+        self.env = env
+        if hasattr(env, "public_cfg"):
+            self.cfg = env.public_cfg
+        elif hasattr(env, "cfg"):
+            self.cfg = env.cfg
+        else:
+            self.cfg = {
+                "name": getattr(env, "config_name", "unknown"),
+                "N": env.N,
+                "C": env.C,
+                "G": env.G,
+                "T": env.T,
+            }
+        self.grid = env.grid
+        self.orders: List[Order] = []
         self.T: int = int(self.env.T)
         self.C: int = int(self.cfg["C"])
         self.rows: int = len(self.grid)

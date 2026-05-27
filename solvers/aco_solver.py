@@ -109,11 +109,11 @@ from typing import Dict, List, Optional, Tuple
 from env import (
     ALPHA,
     DeliveryEnv,
-    GAMMA,
     Order,
     Shipper,
     TIME_UNIT_PER_DAY,
     delivery_reward,
+    move_cost,
     r_base,
 )
 from solvers.solver import Solver
@@ -158,7 +158,21 @@ class ACOSolver(Solver):
     LOCK_BONUS: float = 1.0  # disabled — đã thử và hurts responsiveness
 
     def __init__(self, env: DeliveryEnv):
-        super().__init__(env)
+        self.env = env
+        if hasattr(env, "public_cfg"):
+            self.cfg = env.public_cfg
+        elif hasattr(env, "cfg"):
+            self.cfg = env.cfg
+        else:
+            self.cfg = {
+                "name": getattr(env, "config_name", "unknown"),
+                "N": env.N,
+                "C": env.C,
+                "G": env.G,
+                "T": env.T,
+            }
+        self.grid = env.grid
+        self.orders: List[Order] = []
         self.T: int = int(self.env.T)
         self.C: int = int(self.cfg["C"])
         self.rows: int = len(self.grid)
@@ -266,7 +280,7 @@ class ACOSolver(Solver):
     def _move_cost_estimate(self, dist: int, weight_carried: float, w_max: float) -> float:
         if dist <= 0:
             return 0.0
-        return 0.01 * (1.0 + GAMMA * weight_carried / max(w_max, 1.0)) * dist
+        return -move_cost(weight_carried, w_max) * dist
 
     # ------------------------------------------------------------------
     # Pheromone helpers.

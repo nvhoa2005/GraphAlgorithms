@@ -63,10 +63,10 @@ from typing import Dict, List, Optional, Tuple
 
 from env import (
     DeliveryEnv,
-    GAMMA,
     Order,
     Shipper,
     delivery_reward,
+    move_cost,
 )
 from solvers.solver import Solver
 
@@ -86,7 +86,21 @@ class GreedyBFS(Solver):
     method_name = "GreedyBFS"
 
     def __init__(self, env: DeliveryEnv):
-        super().__init__(env)
+        # env2.DeliveryEnv không còn public_cfg/cfg; tránh isinstance(env, env.DeliveryEnv).
+        self.env = env
+        if hasattr(env, "public_cfg"):
+            self.cfg = env.public_cfg
+        elif hasattr(env, "cfg"):
+            self.cfg = env.cfg
+        else:
+            self.cfg = {
+                "name": getattr(env, "config_name", "unknown"),
+                "N": env.N,
+                "C": env.C,
+                "G": env.G,
+                "T": env.T,
+            }
+        self.grid = env.grid
         self.T: int = int(self.env.T)
         self.rows: int = len(self.grid)
         self.cols: int = len(self.grid[0]) if self.rows else 0
@@ -168,7 +182,8 @@ class GreedyBFS(Solver):
     def _move_cost_est(dist: int, weight: float, w_max: float) -> float:
         if dist <= 0:
             return 0.0
-        return 0.01 * (1.0 + GAMMA * weight / max(w_max, 1.0)) * dist
+        per_step = move_cost(weight, w_max)
+        return -per_step * dist
 
     def _eval_delivery(
         self,
