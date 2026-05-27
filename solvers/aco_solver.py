@@ -1,104 +1,3 @@
-"""
-Ant Colony Optimization (ACO) solver cho Online MAPD — phiên bản tối ưu cao.
-
-Tổng quan
----------
-ACO là metaheuristic mô phỏng đàn kiến. Mỗi "kiến" xây dựng một giải pháp
-(routes cho toàn bộ shipper). Lựa chọn bước kế tiếp dựa trên (a) **pheromone**
-τ(i → j) (kinh nghiệm tích lũy) và (b) **heuristic** η(i → j) (kiến thức tức
-thì: phần thưởng / khoảng cách). Sau mỗi vòng, pheromone bay hơi và được
-bồi đắp dựa trên chất lượng các giải pháp đã sinh ra.
-
-Trong bài toán này, "node" của ACO là **operation** chứ không phải ô lưới:
-    node = ("start", shipper_id)  — vị trí bắt đầu của xe
-    node = ("P", order_id)        — pickup đơn order_id
-    node = ("D", order_id)        — delivery đơn order_id
-
-Các cải tiến chính so với ACO cơ bản
-------------------------------------
-1. **Round-Hungarian seed ant** (`_build_hungarian_ant`): xây dựng theo
-   *vòng*, mỗi vòng mỗi shipper nhận TỐI ĐA 1 action (chọn theo điểm
-   toàn cục, không đụng nhau). Tránh "ăn dồn" — bug mà iterative-Hungarian
-   thuần (chọn 1 best toàn cục liên tục) gây ra: 1 shipper ôm hết công
-   việc, các shipper còn lại idle. Round-Hungarian phân phối công bằng,
-   khớp với Hungarian-greedy của Greedy BFS nhưng kéo dài qua nhiều vòng.
-
-2. **Round-based sampling ant** (`_build_sampling_ant`): cùng cấu trúc
-   round, dùng softmax theo τ^α · η^β để khám phá. Mỗi vòng giải quyết
-   xung đột pickup (2 ant không thể cùng nhặt 1 đơn).
-
-3. **Adaptive replan triggers theo V**: V nhỏ cần plan-stability (period
-   dài, cooldown cao), V vừa/lớn cần responsiveness (period ngắn hơn).
-
-4. **Empty-plan cooldown** (KEY FIX): trigger replan khi shipper VỪA trở
-   nên rỗng (was non-empty → empty) hoặc khi quá `empty_cooldown` ticks
-   từ replan trước (trường hợp Hungarian không gán được task cho shipper
-   đó). Không trigger mỗi tick khi không có việc khả thi — tránh đốt
-   ngân sách CPU vô ích.
-
-5. **Adaptive time / iteration budget**: cấp budget lớn hơn theo n_orders.
-
-6. **Rank-based pheromone update** (Bullnheimer's rank-based AS): top-R
-   ant trong mỗi iteration đều được bồi đắp với trọng số giảm dần.
-
-7. **Elite (best-so-far) deposit**: bồi đắp thêm cho global-best với
-   hệ số ELITE_BONUS.
-
-8. **Local search 2-opt within-route** trên global-best ở cuối session:
-   thử đảo ngược các đoạn con của route, giữ ràng buộc pickup-before-
-   delivery, chấp nhận nếu cải thiện score. Có time cap để không vượt
-   budget.
-
-9. **Pheromone Min-Max bounding** + persistent giữa các lần replan để
-   học liên tục qua toàn episode.
-
-10. **Locked-first stability hook**: hỗ trợ boost first-action trùng với
-    plan cũ qua tham số LOCK_BONUS (mặc định = 1.0 = disabled vì đã thử
-    và làm tệ đi trên cấu hình hẹp — giữ infrastructure để tune sau).
-
-Pipeline
---------
-1. Precompute BFS all-pairs shortest paths trên grid (đồng nhất với các
-   solver khác).
-2. Vòng lặp tick (rolling horizon):
-       - Loại bỏ các bước đã hoàn tất khỏi đầu plan.
-       - Nếu cần (plan trống mới / bất nhất / stale / có đơn mới / kẹt
-         / cooldown expired) thì gọi ACO để rebuild kế hoạch.
-       - Sinh action: pickup tách biệt (an toàn), delivery kết hợp
-         move+op=2.
-3. Trong mỗi lần ACO:
-       - Khởi tạo / kế thừa pheromone toàn cục τ.
-       - Seed bằng Hungarian round-based ant + 1 sampling ant đầu.
-       - Lặp các vòng softmax-sampling ant theo τ^α · η^β.
-       - Sau mỗi vòng: rank-based + elite pheromone update.
-       - Cuối session: local search 2-opt trên global-best.
-       - Cắt sớm khi vượt budget hoặc không cải thiện liên tục.
-
-Độ phức tạp
------------
-Gọi M = số ô trống; V = số shipper; K = số đơn quan sát; R = số ant
-top-rank được deposit.
-- Precompute BFS: O(M^2).
-- Mỗi ant build: O(rounds · V · K) ≈ O(K^2 / V) total.
-- Mỗi lần ACO: O(N_ITER · N_ANTS · ant_build) + local-search O(V · L^2).
-- Bộ nhớ: O(|edges|) cho pheromone sparse, O(V · K) cho plans.
-
-Mức tối ưu
-----------
-**Heuristic / near-optimal trong phạm vi thời gian solve**. ACO không đảm
-bảo tối ưu toàn cục, nhưng:
-- Round-Hungarian seed đảm bảo baseline ≥ Greedy BFS một tick (cả 2 đều
-  Hungarian-greedy assignment).
-- Sampling + rank-based pheromone học qua các replan → tìm ra plan tốt
-  hơn theo thời gian.
-- Local search 2-opt tinh chỉnh route order trong best plan.
-
-Trên Phase 1, ACO tối ưu cuối cùng đạt **+2.6% net reward tổng** so với
-Greedy BFS, thắng rõ trên 4/6 config (C1: +5.7%, C2: +3.6%, C4: +2.6%,
-C5: +11.3%) và sát nút trên 2 config còn lại. Tổng runtime ~20s (gấp ~5
-lần nhanh hơn so với 110s baseline).
-"""
-
 from __future__ import annotations
 
 import random
@@ -121,8 +20,10 @@ from solvers.solver import Solver
 
 Move = str
 Position = Tuple[int, int]
-NodeId = Tuple[str, int]  # ("start"|"P"|"D", id)
-PlanStep = Tuple[int, int, str, int]  # (target_r, target_c, op_type, order_id)
+# ("start"|"P"|"D", id)
+NodeId = Tuple[str, int]
+# (target_r, target_c, op_type, order_id)
+PlanStep = Tuple[int, int, str, int]
 
 INF = 10**9
 MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
@@ -130,32 +31,37 @@ DIRS = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
 
 
 class ACOSolver(Solver):
-    """Online MAPD bằng Ant Colony Optimization tối ưu + rolling-horizon."""
-
     method_name = "ACO"
 
-    # ----- ACO hyperparameters -----
-    ALPHA_TAU: float = 1.0   # trọng số pheromone
-    BETA_ETA: float = 3.5    # trọng số heuristic — đặt cao để bám tham lam tốt
-    RHO: float = 0.12        # tốc độ bay hơi
-    Q: float = 1.0           # hệ số bồi đắp
+    # hyperparameters
+    # trọng số pheromone
+    ALPHA_TAU: float = 1.0
+    # trọng số heuristic
+    BETA_ETA: float = 3.5
+    # tốc độ bay hơi
+    RHO: float = 0.12
+    # hệ số bồi đắp
+    Q: float = 1.0
     TAU_INIT: float = 1.0
     TAU_MIN: float = 0.05
     TAU_MAX: float = 8.0
-    ELITE_BONUS: float = 2.0      # bonus cho best-so-far solution
-    TOP_RANK: int = 3             # số ant deposit theo rank trong mỗi vòng
-    NO_IMPROVE_LIMIT: int = 10    # cắt sớm nếu không cải thiện liên tiếp
+    # bonus cho best-so-far solution
+    ELITE_BONUS: float = 2.0
+    # số ant deposit theo rank trong mỗi vòng
+    TOP_RANK: int = 3
+    # cắt sớm nếu không cải thiện liên tiếp
+    NO_IMPROVE_LIMIT: int = 10
 
     # Giới hạn số đơn unpicked đưa vào một lần solve.
     MAX_UNPICKED_FOR_SOLVE: int = 100
     # Cap candidates per (shipper, step) trong sampling ant để tăng tốc.
     CANDIDATE_CAP: int = 24
 
-    # ----- Replan triggers (adaptive base values; overridden bằng V) -----
+    # Replan triggers
     REPLAN_PERIOD: int = 30
     NEW_ORDER_COOLDOWN: int = 4
     STUCK_LIMIT: int = 2
-    LOCK_BONUS: float = 1.0  # disabled — đã thử và hurts responsiveness
+    LOCK_BONUS: float = 1.0
 
     def __init__(self, env: DeliveryEnv):
         self.env = env
@@ -183,7 +89,7 @@ class ACOSolver(Solver):
         self._step: Dict[Position, Dict[Position, Move]] = {}
         self._precompute_shortest_paths()
 
-        # Pheromone toàn cục — giữ qua các lần replan để học liên tục.
+        # Pheromone toàn cục
         self._pheromone: Dict[Tuple[NodeId, NodeId], float] = {}
         self._rng = random.Random(20260520)
 
@@ -195,10 +101,7 @@ class ACOSolver(Solver):
             i: True for i in range(self.C)
         }
 
-        # Adaptive triggers theo V (số shipper).
-        # Sau khi fix empty-plan trigger, có thể dùng cooldown nhỏ (vì replan
-        # không còn fire mỗi tick). Period giữ vừa phải để cho plan thời gian
-        # chạy nhưng vẫn refresh định kỳ.
+        # Adaptive triggers theo số shipper
         V = self.C
         if V <= 2:
             self.REPLAN_PERIOD = 40
@@ -210,9 +113,7 @@ class ACOSolver(Solver):
             self.REPLAN_PERIOD = 25
             self.NEW_ORDER_COOLDOWN = 3
 
-    # ------------------------------------------------------------------
     # BFS precompute.
-    # ------------------------------------------------------------------
     def _precompute_shortest_paths(self) -> None:
         free_cells: List[Position] = [
             (r, c)
@@ -266,9 +167,7 @@ class ACOSolver(Solver):
             return "S"
         return self._step.get(a, {}).get(b, "S")
 
-    # ------------------------------------------------------------------
     # Heuristic helpers.
-    # ------------------------------------------------------------------
     @staticmethod
     def _bag_weight(shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -282,9 +181,7 @@ class ACOSolver(Solver):
             return 0.0
         return -move_cost(weight_carried, w_max) * dist
 
-    # ------------------------------------------------------------------
     # Pheromone helpers.
-    # ------------------------------------------------------------------
     def _tau(self, frm: NodeId, to: NodeId) -> float:
         return self._pheromone.get((frm, to), self.TAU_INIT)
 
@@ -306,9 +203,7 @@ class ACOSolver(Solver):
             cur = self._pheromone.get(e, self.TAU_INIT)
             self._pheromone[e] = self._clip_tau(cur + amount)
 
-    # ------------------------------------------------------------------
     # Hungarian-iterative construction ant (deterministic, strong baseline).
-    # ------------------------------------------------------------------
     def _build_hungarian_ant(
         self,
         obs: dict,
@@ -316,14 +211,7 @@ class ACOSolver(Solver):
         bag_orders: Dict[int, List[Order]],
         locked_first: Optional[Dict[int, Tuple[str, int]]] = None,
     ) -> Tuple[Dict[int, List[PlanStep]], float, List[Tuple[NodeId, NodeId]]]:
-        """Build solution bằng **round-Hungarian**: mỗi round, mỗi shipper
-        nhận TỐI ĐA 1 action (chọn theo score giảm dần, không đụng nhau).
-        Phân phối công bằng giữa các shipper — trái với one-shot iterative
-        Hungarian (sẽ "ăn dồn" cho 1 shipper duy nhất).
 
-        `locked_first` (optional): dict[shipper_id] -> (op_type, oid) — gợi
-        ý first action cho shipper. Nếu khớp candidate, boost LOCK_BONUS.
-        """
         shippers_list: List[Shipper] = obs["shippers"]
         orders_map: Dict[int, Order] = obs["orders"]
         t_now: int = int(obs.get("t", 0))
@@ -354,7 +242,7 @@ class ACOSolver(Solver):
         max_rounds = max(4, (n_total // max(1, len(shippers_list))) + 4)
 
         for _ in range(max_rounds):
-            # Build candidates (sid, op, oid, score, d, rwd) cho TẤT CẢ shippers.
+            # Build candidates cho tất cả shippers.
             cands: List[Tuple[float, int, str, int, int, float]] = []
 
             for s in shippers_list:
@@ -362,8 +250,6 @@ class ACOSolver(Solver):
                 is_first = (sid in locked_first) and (sid not in handled_first)
                 lock_op = locked_first.get(sid, (None, None))[0]
                 lock_oid = locked_first.get(sid, (None, None))[1]
-                # Dùng t_now cho first action (matching Greedy optimism); dùng
-                # cur_time cho subsequent actions trong plan (accuracy).
                 t_eval = t_now if len(routes[sid]) == 0 else cur_time[sid]
 
                 # Delivery ứng viên.
@@ -426,11 +312,11 @@ class ACOSolver(Solver):
                     continue
                 s = shipper_by_id[sid]
                 o = orders_map[oid]
-                # Validate (state có thể đã đổi sau các round trước).
+                # Validate
                 if op_t == "D":
                     if oid not in bag_set[sid]:
                         continue
-                else:  # P
+                else:
                     if oid not in available:
                         continue
                     if bag_n[sid] >= s.K_max:
@@ -438,7 +324,7 @@ class ACOSolver(Solver):
                     if bag_w[sid] + o.w > s.W_max:
                         continue
 
-                # Apply.
+                # Apply
                 if op_t == "P":
                     routes[sid].append((o.sx, o.sy, "P", oid))
                     edges.append((last_node[sid], ("P", oid)))
@@ -475,10 +361,7 @@ class ACOSolver(Solver):
 
         return routes, score, edges
 
-    # ------------------------------------------------------------------
-    # Stochastic ant — round-based sampling (mỗi round mỗi shipper ≤ 1 ops)
-    # Sử dụng softmax theo τ^α · η^β + pickup-conflict resolution.
-    # ------------------------------------------------------------------
+    # Stochastic ant — round-based sampling
     def _build_sampling_ant(
         self,
         obs: dict,
@@ -518,7 +401,7 @@ class ACOSolver(Solver):
         max_rounds = max(4, (n_total // max(1, len(shippers_list))) + 4)
 
         for _ in range(max_rounds):
-            # Sinh candidates cho mọi shipper trong round này.
+            # Sinh candidates cho mọi shipper
             cands: List[Tuple[float, int, str, int, int, float]] = []
             # (weight_aco, sid, op_type, oid, dist, exp_reward)
 
@@ -593,7 +476,6 @@ class ACOSolver(Solver):
             if not cands:
                 break
 
-            # Cap (tổng candidates) cho tốc độ.
             if len(cands) > self.CANDIDATE_CAP * len(shippers_list):
                 cands.sort(key=lambda x: -x[0])
                 cands = cands[: self.CANDIDATE_CAP * len(shippers_list)]
@@ -602,10 +484,7 @@ class ACOSolver(Solver):
             reserved_pickups: set = set()
             applied_any = False
 
-            # Lặp: mỗi vòng inner-loop, sample ONE (sid, action), apply,
-            # cho tới khi không còn ứng viên hợp lệ trong round.
             while True:
-                # Lọc còn hợp lệ trong round.
                 valid: List[Tuple[float, int, str, int, int, float]] = []
                 total_w = 0.0
                 for c in cands:
@@ -635,7 +514,7 @@ class ACOSolver(Solver):
                 s = shipper_by_id[sid]
                 o = orders_map[oid]
 
-                # Validate (định kỳ).
+                # Validate
                 if op_t == "D" and oid not in bag_set[sid]:
                     assigned_this_round.add(sid)
                     continue
@@ -649,7 +528,7 @@ class ACOSolver(Solver):
                         assigned_this_round.add(sid)
                         continue
 
-                # Apply.
+                # Apply
                 if op_t == "P":
                     routes[sid].append((o.sx, o.sy, "P", oid))
                     edges.append((last_node[sid], ("P", oid)))
@@ -686,20 +565,14 @@ class ACOSolver(Solver):
 
         return routes, score, edges
 
-    # ------------------------------------------------------------------
-    # Local search trên solution (cải thiện best ant).
-    # Đơn giản & nhanh: chỉ 2-opt within-route, single pass, có time cap.
-    # ------------------------------------------------------------------
+    # Local search trên solution
     def _local_search(
         self,
         obs: dict,
         routes: Dict[int, List[PlanStep]],
         deadline: float,
     ) -> Tuple[Dict[int, List[PlanStep]], float, List[Tuple[NodeId, NodeId]]]:
-        """2-opt within-route, single pass với best-improvement.
 
-        Tham số `deadline` là wall-clock cutoff (time.time() unit).
-        """
         shippers_list: List[Shipper] = obs["shippers"]
         orders_map: Dict[int, Order] = obs["orders"]
         t_now: int = int(obs.get("t", 0))
@@ -755,15 +628,13 @@ class ACOSolver(Solver):
 
     @staticmethod
     def _is_valid_route(route: List[PlanStep]) -> bool:
-        """Validate: nếu cặp (P, D) cùng oid đều xuất hiện trong route thì
-        P phải đứng trước D. Đơn nằm trong bag (chỉ có D, không có P) hợp lệ.
-        """
+        
         pickup_idx: Dict[int, int] = {}
         for idx, step in enumerate(route):
             _r, _c, op_t, oid = step
             if op_t == "P":
                 if oid in pickup_idx:
-                    return False  # pickup trùng
+                    return False
                 pickup_idx[oid] = idx
         for idx, step in enumerate(route):
             _r, _c, op_t, oid = step
@@ -779,7 +650,7 @@ class ACOSolver(Solver):
         orders_map: Dict[int, Order],
         t_now: int,
     ) -> Tuple[float, List[Tuple[NodeId, NodeId]]]:
-        """Tính score (sum net reward) + edges (cho deposit pheromone)."""
+        
         edges: List[Tuple[NodeId, NodeId]] = []
         total = 0.0
         for s in shippers_list:
@@ -817,11 +688,9 @@ class ACOSolver(Solver):
                 pos = target
         return total, edges
 
-    # ------------------------------------------------------------------
     # ACO main loop.
-    # ------------------------------------------------------------------
     def _adaptive_budget(self, n_orders: int) -> Tuple[float, int, int]:
-        """Return (time_budget_s, n_ants, n_iterations) tuỳ kích thước bài toán."""
+        
         if n_orders <= 8:
             return 0.5, 10, 20
         if n_orders <= 20:
@@ -849,7 +718,6 @@ class ACOSolver(Solver):
         best_score = -float("inf")
         best_edges: List[Tuple[NodeId, NodeId]] = []
 
-        # ---- Seed 1: Hungarian-iterative (đảm bảo ≥ Greedy BFS) ----
         h_routes, h_score, h_edges = self._build_hungarian_ant(
             obs, unpicked, bag_orders, locked_first
         )
@@ -858,7 +726,6 @@ class ACOSolver(Solver):
             best_routes = h_routes
             best_edges = h_edges
 
-        # ---- Seed 2: 1 shuffled-greedy ant để diversity ----
         try:
             g_routes, g_score, g_edges = self._build_sampling_ant(
                 obs, unpicked, bag_orders, self._rng, locked_first
@@ -870,7 +737,6 @@ class ACOSolver(Solver):
         except Exception:
             pass
 
-        # ---- ACO iterations (chỉ construction + pheromone update) ----
         no_improve = 0
         for it in range(n_iter):
             if time.time() > deadline:
@@ -902,10 +768,9 @@ class ACOSolver(Solver):
                     best_edges = eds
                     no_improve = -1
 
-            # ---- Pheromone update ----
+            # Pheromone update
             self._evaporate()
 
-            # Rank-based deposit (top-R ant trong iteration).
             iter_solutions.sort(key=lambda x: -x[0])
             top = iter_solutions[: self.TOP_RANK]
             for rank, (sc, eds) in enumerate(top):
@@ -915,7 +780,6 @@ class ACOSolver(Solver):
                 amt = self.Q * (sc / norm) * ((self.TOP_RANK - rank) / self.TOP_RANK)
                 self._deposit(eds, amt)
 
-            # Elite (best-so-far) bonus.
             if best_routes is not None and best_score > 0 and best_edges:
                 norm = max(1.0, abs(best_score))
                 amt = self.Q * (best_score / norm) * self.ELITE_BONUS
@@ -923,8 +787,6 @@ class ACOSolver(Solver):
 
             no_improve += 1
 
-        # ---- Local search ở cuối, một lần, trên global best ----
-        # Cấp 25% budget còn dư cho LS (tối thiểu 0.2s).
         if best_routes is not None:
             ls_deadline = max(
                 time.time() + 0.2,
@@ -943,9 +805,7 @@ class ACOSolver(Solver):
             else {s.id: [] for s in obs["shippers"]}
         )
 
-    # ------------------------------------------------------------------
     # Replan entrypoint.
-    # ------------------------------------------------------------------
     def _replan(self, obs: dict) -> None:
         orders_map: Dict[int, Order] = obs["orders"]
         shippers: List[Shipper] = obs["shippers"]
@@ -970,7 +830,6 @@ class ACOSolver(Solver):
         if len(unpicked) > self.MAX_UNPICKED_FOR_SOLVE:
             unpicked = unpicked[: self.MAX_UNPICKED_FOR_SOLVE]
 
-        # Xây dựng locked_first từ plan cũ — giảm thrashing.
         locked_first: Dict[int, Tuple[str, int]] = {}
         for s in shippers:
             plan = self.plans.get(s.id, [])
@@ -982,28 +841,24 @@ class ACOSolver(Solver):
                 continue
             if op_t == "P":
                 if not o.picked:
-                    # Pickup vẫn khả thi cho shipper s nếu còn slot/trọng tải
                     if len(s.bag) < s.K_max and (
                         sum(orders_map[b].w for b in s.bag if b in orders_map)
                         + o.w
                         <= s.W_max
                     ):
                         locked_first[s.id] = (op_t, oid)
-            else:  # "D"
+            else:
                 if oid in s.bag:
                     locked_first[s.id] = (op_t, oid)
 
         routes = self._aco_search(obs, unpicked, bag_orders, locked_first)
         for s in shippers:
             self.plans[s.id] = routes.get(s.id, [])
-        # Cập nhật snapshot trạng thái empty SAU khi replan đã đặt plan.
         self._empty_at_last_replan = {
             s.id: len(self.plans[s.id]) == 0 for s in shippers
         }
 
-    # ------------------------------------------------------------------
     # Quản lý plan.
-    # ------------------------------------------------------------------
     def _advance_plans(self, obs: dict) -> bool:
         orders_map: Dict[int, Order] = obs["orders"]
         invalid = False
@@ -1047,11 +902,6 @@ class ACOSolver(Solver):
         if invalid_after_advance:
             return True
 
-        # Empty-plan trigger: shipper hoàn thành plan và có công việc tiềm năng.
-        # Quan trọng: chỉ trigger nếu shipper VỪA trở nên rỗng (was non-empty
-        # before this tick) HOẶC nếu đã đủ EMPTY_REPLAN_COOLDOWN từ lần
-        # replan trước (tránh re-replan mỗi tick khi không có việc khả thi
-        # cho shipper).
         empty_cooldown = max(self.NEW_ORDER_COOLDOWN, 3)
         for s in shippers:
             if not self.plans[s.id]:
@@ -1090,9 +940,7 @@ class ACOSolver(Solver):
             return (move, 2)
         return (move, 2 if shipper.bag else 0)
 
-    # ------------------------------------------------------------------
     # Main loop.
-    # ------------------------------------------------------------------
     def run(self) -> dict:
         start_time = time.time()
         obs = self.env.reset()

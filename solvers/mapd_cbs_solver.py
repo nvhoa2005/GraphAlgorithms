@@ -1,64 +1,3 @@
-"""
-Multi-Agent Pickup and Delivery với Conflict-Based Search (MAPD-CBS).
-
-Tổng quan
----------
-MAPD-CBS giải bài toán phối hợp đa tác tử bằng 2 tầng:
-- **Tầng cao (High-level CBS):** duy trì một cây ràng buộc (Constraint Tree).
-  Mỗi node lưu (a) tập ràng buộc cho từng agent (vertex/edge constraints),
-  (b) đường đi của mỗi agent, (c) chi phí. Khi phát hiện xung đột giữa 2
-  agent, node tách thành 2 con — mỗi con thêm 1 ràng buộc cho 1 agent.
-- **Tầng thấp (Low-level A*):** với mỗi agent, A* thời-gian-mở-rộng tìm
-  đường đi tôn trọng tất cả ràng buộc đã thêm.
-
-Định nghĩa xung đột (theo mô hình env)
---------------------------------------
-- **Vertex conflict**: hai agent đứng cùng 1 ô tại cùng thời điểm t.
-- **Edge conflict (swap)**: agent i tại ô X bước sang Y, đồng thời agent j
-  tại Y bước sang X (cùng thời điểm). Env xử lý va chạm bằng id-priority
-  nhưng *không* xử lý edge swap → cả hai bị kẹt. CBS giải quyết dứt điểm
-  trước khi gọi env.
-
-Mô hình online
---------------
-Đơn được sinh dần theo Poisson, mỗi lần "replan" CBS chỉ lên kế hoạch
-trong **một cửa sổ thời gian ngắn** (`WINDOW` bước). Sau khi cửa sổ hết
-hoặc có sự kiện (đơn mới / hoàn thành task / kẹt / plan bất nhất), tổng
-hợp trạng thái và CBS lại.
-
-Pipeline mỗi tick
------------------
-1. `_advance_tasks`: pop đầu hàng đợi task nếu agent đã hoàn tất
-   (đã nhặt / đã giao). Phát hiện task bất nhất (bị xe khác nhặt).
-2. `_needs_replan` → nếu True thì:
-       a. `_assign_tasks`: gán đơn cho shipper bằng greedy theo
-          score = (potential_reward) / (1 + distance). Đơn trong bag được
-          xếp đầu hàng đợi theo deadline.
-       b. `_cbs_solve`: chạy CBS trong cửa sổ WINDOW bước, time-bound.
-3. `_action_for`: lấy bước kế tiếp từ CBS path; sinh action (move, op).
-
-Mức tối ưu
-----------
-- CBS với A* admissible (heuristic BFS đúng = khoảng cách thật) là
-  **complete và optimal cho MAPF** đối với hàm mục tiêu sum-of-costs khi
-  chạy đến tận cùng cây. Trong implementation này ta giới hạn (a) cửa sổ
-  thời gian, (b) số node CBS expand, (c) time budget — nên thực tế đạt
-  **near-optimal trong cửa sổ** chứ không phải optimal toàn cục.
-- Phần gán task là **heuristic**, không tối ưu — đó là phần thường gặp
-  trong các hệ thống MAPD công nghiệp (token-passing, regret-insertion…).
-- Vì online + heuristic assignment → toàn hệ thống là **heuristic /
-  near-optimal**.
-
-Độ phức tạp
------------
-Gọi M = số ô trống, V = số shipper, W = WINDOW, K = số đơn quan sát.
-- BFS precompute: O(M^2).
-- A* low-level/agent: O(M · W · log(M·W)) trường hợp xấu.
-- CBS high-level: tệ nhất hàm mũ theo số xung đột; được khống chế bằng
-  MAX_CBS_NODES + CBS_TIME_LIMIT_S.
-- Bộ nhớ: O(V · W) cho paths, O(M^2) cho BFS table.
-"""
-
 from __future__ import annotations
 
 import heapq
@@ -78,7 +17,7 @@ from solvers.solver import Solver
 
 Move = str
 Position = Tuple[int, int]
-TaskEntry = Tuple[str, int, Position]  # (op_type, order_id, target)
+TaskEntry = Tuple[str, int, Position]
 
 INF = 10**9
 MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
@@ -93,20 +32,20 @@ MOVE_OF_DELTA = {
 
 
 class MAPDCBSSolver(Solver):
-    """Online MAPD bằng CBS với task assignment + windowed planning."""
 
     method_name = "MAPD-CBS"
 
-    # ----- CBS / A* hyperparameters -----
-    WINDOW: int = 12          # số bước CBS lên kế hoạch mỗi lần.
-    MAX_CBS_NODES: int = 60   # giới hạn số node high-level expand.
+    # số bước CBS
+    WINDOW: int = 12
+    # giới hạn số node high-level expand
+    MAX_CBS_NODES: int = 60
     CBS_TIME_LIMIT_S: float = 1.2
     ASTAR_NODE_LIMIT: int = 8000
 
-    # ----- Task assignment -----
+    # Task assignment
     MAX_UNPICKED_ASSIGN: int = 120
 
-    # ----- Replan triggers -----
+    # Replan triggers
     REPLAN_PERIOD: int = 12
     NEW_ORDER_COOLDOWN: int = 5
     STUCK_LIMIT: int = 2
@@ -132,23 +71,21 @@ class MAPDCBSSolver(Solver):
         self.rows: int = len(self.grid)
         self.cols: int = len(self.grid[0]) if self.rows else 0
 
-        # BFS all-pairs distance (heuristic admissible cho A*).
+        # BFS all-pairs
         self._dist: Dict[Position, Dict[Position, int]] = {}
         self._step: Dict[Position, Dict[Position, Move]] = {}
         self._precompute_shortest_paths()
 
-        # Hàng đợi task cho mỗi shipper.
+        # Hàng đợi task cho mỗi shipper
         self.tasks: Dict[int, deque] = {i: deque() for i in range(self.C)}
-        # Đường đi CBS đã hoạch định (index theo thời gian tương đối path_t0).
+        # Đường đi CBS đã hoạch định
         self.paths: Dict[int, List[Position]] = {i: [] for i in range(self.C)}
         self.path_t0: int = -1
 
         self._last_replan_t: int = -(10**9)
         self._stuck_counter: Dict[int, int] = {i: 0 for i in range(self.C)}
 
-    # ------------------------------------------------------------------
     # BFS precompute.
-    # ------------------------------------------------------------------
     def _precompute_shortest_paths(self) -> None:
         free_cells: List[Position] = [
             (r, c)
@@ -197,9 +134,7 @@ class MAPDCBSSolver(Solver):
             return 0
         return self._dist.get(a, {}).get(b, INF)
 
-    # ------------------------------------------------------------------
-    # Task assignment (greedy + best-insertion theo end_pos hiện tại).
-    # ------------------------------------------------------------------
+    # Task assignment
     @staticmethod
     def _bag_weight(s: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in s.bag if oid in orders)
@@ -208,17 +143,17 @@ class MAPDCBSSolver(Solver):
         shippers: List[Shipper] = obs["shippers"]
         orders_map: Dict[int, Order] = obs["orders"]
 
-        # Reset hàng đợi.
+        # Reset hàng đợi
         self.tasks = {s.id: deque() for s in shippers}
 
-        # Bước 1: xếp delivery cho các đơn đang trong bag (theo deadline).
+        # Xếp delivery cho các đơn đang trong bag (theo deadline)
         for s in shippers:
             in_bag = [orders_map[oid] for oid in s.bag if oid in orders_map]
             in_bag.sort(key=lambda o: (o.et, -o.p, o.id))
             for o in in_bag:
                 self.tasks[s.id].append(("D", o.id, (o.ex, o.ey)))
 
-        # Bước 2: gán đơn unpicked.
+        # Gán đơn unpicked
         unpicked: List[Order] = [
             o for o in orders_map.values() if (not o.delivered) and (not o.picked)
         ]
@@ -226,7 +161,7 @@ class MAPDCBSSolver(Solver):
         if len(unpicked) > self.MAX_UNPICKED_ASSIGN:
             unpicked = unpicked[: self.MAX_UNPICKED_ASSIGN]
 
-        # State để theo dõi khi gán nhiều đơn liên tiếp.
+        # State theo dõi khi gán nhiều đơn liên tiếp
         end_pos: Dict[int, Position] = {
             s.id: (self.tasks[s.id][-1][2] if self.tasks[s.id] else s.position)
             for s in shippers
@@ -253,8 +188,6 @@ class MAPDCBSSolver(Solver):
                 if d_d >= INF:
                     continue
                 potential = ALPHA[o.p] * r_base(o.w) * 2.0
-                # Càng gần và càng có giá trị càng ưu tiên; phạt nhẹ những
-                # đơn dài chuyến để tránh shipper bị "ràng" vào một đơn xa.
                 score = potential / (d_p + d_d + 1.0)
                 if score > best_score:
                     best_score = score
@@ -267,9 +200,7 @@ class MAPDCBSSolver(Solver):
             bag_count[best_sid] += 1
             bag_weight[best_sid] += o.w
 
-    # ------------------------------------------------------------------
-    # Low-level A* với ràng buộc thời gian.
-    # ------------------------------------------------------------------
+    # Low-level A*
     def _astar(
         self,
         start: Position,
@@ -278,18 +209,7 @@ class MAPDCBSSolver(Solver):
         edge_cons: Set[Tuple[Position, Position, int]],
         window: int,
     ) -> Optional[List[Position]]:
-        """A* trên (pos, time). Trả về path = [(r,c)] dài tối đa window+1.
-
-        - vertex_cons: tập {(pos, t): agent không được đứng tại pos vào time t}.
-        - edge_cons: tập {(from, to, t): agent không được di chuyển from→to
-          giữa time t và t+1}.
-        - window: số bước tối đa.
-
-        Quan trọng: nếu goal nằm ngoài window (> window bước), A* không thể
-        đến nơi trong cửa sổ. Khi đó trả về **path tốt nhất một phần** —
-        path đi đến state có khoảng cách BFS tới goal nhỏ nhất (tie-break:
-        thời gian lớn hơn). Sau đó CBS sẽ replan ở cửa sổ kế.
-        """
+        
         if start == goal:
             path: List[Position] = [start]
             for t in range(1, window + 1):
@@ -298,7 +218,6 @@ class MAPDCBSSolver(Solver):
                 path.append(start)
             if len(path) >= window + 1:
                 return path
-            # Nếu không thể đứng yên đủ window thì rơi xuống A* bên dưới.
 
         h0 = self._distance(start, goal)
         if h0 >= INF:
@@ -312,7 +231,6 @@ class MAPDCBSSolver(Solver):
 
         nodes_expanded = 0
         goal_state: Optional[Tuple[Position, int]] = None
-        # Best-partial: state có khoảng cách BFS tới goal nhỏ nhất, ưu tiên t lớn.
         best_state: Tuple[Position, int] = (start, 0)
         best_h: int = h0
         best_g: int = 0
@@ -329,7 +247,7 @@ class MAPDCBSSolver(Solver):
                 goal_state = (pos, t)
                 break
 
-            # Cập nhật best-partial.
+            # Cập nhật best-partial
             h_remaining = self._distance(pos, goal)
             if h_remaining < best_h or (h_remaining == best_h and g > best_g):
                 best_h = h_remaining
@@ -370,11 +288,10 @@ class MAPDCBSSolver(Solver):
                     tie += 1
                     heapq.heappush(heap, (ng + h, ng, tie, nxt, nt))
 
-        # Chọn state cuối: goal nếu tới được, ngược lại best-partial.
+        # Chọn state cuối: goal nếu tới được, ngược lại best-partial
         final_state = goal_state if goal_state is not None else best_state
 
         if final_state == (start, 0):
-            # Không đi được đâu cả: cố đứng yên (nếu được).
             path = [start]
             for t in range(1, window + 1):
                 if (start, t) in vertex_cons:
@@ -382,7 +299,7 @@ class MAPDCBSSolver(Solver):
                 path.append(start)
             return path if path else None
 
-        # Truy ngược path tới start.
+        # Truy ngược path tới start
         rev: List[Position] = []
         cur = final_state
         while True:
@@ -392,7 +309,7 @@ class MAPDCBSSolver(Solver):
             cur = parent[cur]
         path = list(reversed(rev))
 
-        # Mở rộng phần đuôi bằng cách đứng tại vị trí cuối nếu không bị cấm.
+        # Mở rộng phần đuôi bằng cách đứng tại vị trí cuối nếu không bị cấm
         last_pos = path[-1]
         while len(path) < window + 1:
             next_t = len(path)
@@ -402,9 +319,7 @@ class MAPDCBSSolver(Solver):
 
         return path
 
-    # ------------------------------------------------------------------
-    # Phát hiện xung đột.
-    # ------------------------------------------------------------------
+    # Phát hiện xung đột
     def _find_first_conflict(
         self, paths: Dict[int, List[Position]]
     ) -> Optional[Tuple[int, int, str, dict]]:
@@ -413,7 +328,7 @@ class MAPDCBSSolver(Solver):
             return None
         max_t = max(len(paths[sid]) for sid in agent_ids)
         for t in range(max_t):
-            # Lấy vị trí tại thời điểm t (nếu path ngắn hơn → giữ vị trí cuối).
+            # Lấy vị trí tại thời điểm t
             pos_t: Dict[int, Position] = {
                 sid: paths[sid][min(t, len(paths[sid]) - 1)] for sid in agent_ids
             }
@@ -424,7 +339,7 @@ class MAPDCBSSolver(Solver):
                 if p in seen:
                     return (seen[p], sid, "vertex", {"pos": p, "t": t})
                 seen[p] = sid
-            # Edge conflict (chỉ nếu t+1 hợp lệ).
+            # Edge conflict (chỉ nếu t+1 hợp lệ)
             if t + 1 < max_t:
                 pos_t1: Dict[int, Position] = {
                     sid: paths[sid][min(t + 1, len(paths[sid]) - 1)]
@@ -487,9 +402,7 @@ class MAPDCBSSolver(Solver):
                             cnt += 1
         return cnt
 
-    # ------------------------------------------------------------------
     # CBS high-level.
-    # ------------------------------------------------------------------
     def _cbs_solve(self, obs: dict) -> None:
         shippers: List[Shipper] = obs["shippers"]
         t_now = int(obs.get("t", 0))
@@ -556,7 +469,6 @@ class MAPDCBSSolver(Solver):
 
             agent_a, agent_b, ctype, cinfo = conflict
             for aid in (agent_a, agent_b):
-                # Clone constraints (deep enough — sao chép set theo agent).
                 new_cons: Dict[int, Dict[str, Set]] = {
                     sid: {
                         "vertex": set(cons[sid]["vertex"]),
@@ -614,9 +526,7 @@ class MAPDCBSSolver(Solver):
                 return i
         return len(path)
 
-    # ------------------------------------------------------------------
-    # Quản lý task + xác định cần replan.
-    # ------------------------------------------------------------------
+    # Quản lý task + xác định cần replan
     def _advance_tasks(self, obs: dict) -> bool:
         """Pop task đã hoàn thành; trả về True nếu phát hiện bất nhất."""
         orders_map: Dict[int, Order] = obs["orders"]
@@ -661,36 +571,34 @@ class MAPDCBSSolver(Solver):
         if invalid:
             return True
 
-        # Chưa từng plan, hoặc có shipper chưa có task.
+        # Chưa từng plan, hoặc có shipper chưa có task
         if self.path_t0 < 0:
             return True
         for s in shippers:
             if not self.tasks[s.id] and (s.bag or has_unpicked):
                 return True
 
-        # Cửa sổ planning sắp/đã hết.
+        # Cửa sổ planning sắp hoặc đã hết
         if t_now - self.path_t0 >= self.WINDOW - 1:
             return True
 
-        # Có đơn mới (qua cooldown).
+        # Có đơn mới (qua cooldown)
         if obs.get("new_order_ids"):
             if t_now - self._last_replan_t >= self.NEW_ORDER_COOLDOWN:
                 return True
 
-        # Bị kẹt.
+        # Bị kẹt
         for s in shippers:
             if self._stuck_counter.get(s.id, 0) >= self.STUCK_LIMIT and self.tasks[s.id]:
                 return True
 
-        # Đến chu kỳ replan.
+        # Đến chu kỳ replan
         if t_now - self._last_replan_t >= self.REPLAN_PERIOD:
             return True
 
         return False
 
-    # ------------------------------------------------------------------
-    # Sinh action dựa trên CBS path.
-    # ------------------------------------------------------------------
+    # Sinh action dựa trên CBS path
     def _action_for(self, shipper: Shipper, t_now: int) -> Tuple[Move, int]:
         sid = shipper.id
         if not self.tasks[sid]:
@@ -698,18 +606,18 @@ class MAPDCBSSolver(Solver):
 
         op_t, _oid, target = self.tasks[sid][0]
 
-        # Tra cứu position mong đợi từ path CBS.
+        # Tra cứu position mong đợi từ path CBS
         idx = t_now - self.path_t0
         path = self.paths.get(sid, [])
         if not path or idx < 0 or idx >= len(path) - 1:
-            # Plan hết hoặc bất nhất → fallback đi thẳng tới target qua BFS.
+            # Plan hết hoặc bất nhất → fallback đi thẳng tới target qua BFS
             if shipper.position == target:
                 return ("S", 1 if op_t == "P" else 2)
             move = self._step.get(shipper.position, {}).get(target, "S")
             return (move, 2) if op_t == "D" else (move, 0)
 
         next_pos = path[idx + 1]
-        # Nếu plan bị lệch khỏi vị trí thực tế (do va chạm hiếm gặp) → fallback BFS.
+        # Nếu plan bị lệch khỏi vị trí thực tế (do va chạm hiếm gặp) → fallback BFS
         if path[idx] != shipper.position:
             if shipper.position == target:
                 return ("S", 1 if op_t == "P" else 2)
@@ -723,12 +631,10 @@ class MAPDCBSSolver(Solver):
             return (move, 1 if op_t == "P" else 2)
         if shipper.position == target:
             return ("S", 1 if op_t == "P" else 2)
-        # Cho phép op=2 "cơ hội" trên đường nếu task hiện tại là delivery.
+        # Cho phép op=2 "cơ hội" trên đường nếu task hiện tại là delivery
         return (move, 2) if op_t == "D" else (move, 0)
 
-    # ------------------------------------------------------------------
     # Main loop.
-    # ------------------------------------------------------------------
     def run(self) -> dict:
         start_time = time.time()
         obs = self.env.reset()
