@@ -1,28 +1,12 @@
 from __future__ import annotations
 
+import random
 import time
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from env import (
-    ALPHA,
-    BETA,
-    DeliveryEnv,
-    Order,
-    Shipper,
-    is_valid_cell,
-    r_base,
-    valid_next_pos,
-)
+from env import ALPHA, BETA, DeliveryEnv, Order, Shipper, r_base
 from solvers.solver import Solver
-
-try:
-    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-
-    _HAS_ORTOOLS = True
-except Exception:
-    _HAS_ORTOOLS = False
-
 
 Move = str
 Position = Tuple[int, int]
@@ -33,22 +17,666 @@ INF = 10**9
 MOVES: Tuple[Move, ...] = ("U", "D", "L", "R")
 DIRS = {"U": (-1, 0), "D": (1, 0), "L": (0, -1), "R": (0, 1)}
 
-# Hệ số scale
 REWARD_SCALE = 100
 WEIGHT_SCALE = 100
 
+Index = int
+Node = int
+TransitCallback = Callable[[Index, Index], int]
+UnaryCallback = Callable[[Index], int]
+
+
+# VRP routing engine
+class RoutingIndexManager:
+    def __init__(
+        self,
+        num_nodes: int,
+        num_vehicles: int,
+        starts: Sequence[int],
+        ends: Sequence[int],
+    ) -> None:
+        self.num_nodes = num_nodes
+        self.num_vehicles = num_vehicles
+        self.starts = list(starts)
+        self.ends = list(ends)
+
+    def IndexToNode(self, index: Index) -> Node:
+        return index
+
+    def NodeToIndex(self, node: Node) -> Index:
+        return node
+
+
+class RoutingSearchParameters:
+    def __init__(self) -> None:
+        self.time_limit_ms: int = 1000
+        self.first_solution_strategy: str = "parallel_cheapest_insertion"
+        self.local_search_metaheuristic: str = "guided_local_search"
+
+
+def default_routing_search_parameters() -> RoutingSearchParameters:
+    return RoutingSearchParameters()
+
+
+class DimensionSpec:
+    def __init__(
+        self,
+        name: str,
+        transit_cb: Optional[TransitCallback] = None,
+        unary_cb: Optional[UnaryCallback] = None,
+        slack_max: int = 0,
+        capacity: int = 0,
+        vehicle_capacity: Optional[List[int]] = None,
+        fix_start_cumul_to_zero: bool = False,
+    ) -> None:
+        self.name = name
+        self.transit_cb = transit_cb
+        self.unary_cb = unary_cb
+        self.slack_max = slack_max
+        self.capacity = capacity
+        self.vehicle_capacity = vehicle_capacity
+        self.fix_start_cumul_to_zero = fix_start_cumul_to_zero
+        self.start_cumul: Dict[int, int] = {}
+        self.soft_upper_bounds: List[Tuple[Index, int, int]] = []
+
+
+class PickupDeliveryPair:
+    def __init__(self, pickup_index: Index, delivery_index: Index) -> None:
+        self.pickup_index = pickup_index
+        self.delivery_index = delivery_index
+
+
+class DisjunctionSpec:
+    def __init__(self, indices: Tuple[Index, ...], penalty: int) -> None:
+        self.indices = indices
+        self.penalty = penalty
+
+
+class RoutingSolution:
+    def __init__(self, next_map: Dict[Index, Index]) -> None:
+        self._next = next_map
+
+    def Value(self, index: Index) -> Index:
+        return self._next[index]
+
+
+class RoutingModel:
+    PARALLEL_CHEAPEST_INSERTION = "parallel_cheapest_insertion"
+    GUIDED_LOCAL_SEARCH = "guided_local_search"
+
+    def __init__(self, manager: RoutingIndexManager) -> None:
+        self._manager = manager
+        self._transit_callbacks: List[TransitCallback] = []
+        self._unary_callbacks: List[UnaryCallback] = []
+        self._arc_cost_cb: Optional[TransitCallback] = None
+        self._dimensions: Dict[str, DimensionSpec] = {}
+        self._pickup_delivery: List[PickupDeliveryPair] = []
+        self._disjunctions: List[DisjunctionSpec] = []
+        self._fixed_vehicle: Dict[Index, List[int]] = {}
+        self._rng = random.Random(42)
+
+    def RegisterTransitCallback(self, cb: TransitCallback) -> int:
+        idx = len(self._transit_callbacks)
+        self._transit_callbacks.append(cb)
+        return idx
+
+    def RegisterUnaryTransitCallback(self, cb: UnaryCallback) -> int:
+        idx = len(self._unary_callbacks)
+        self._unary_callbacks.append(cb)
+        return idx
+
+    def SetArcCostEvaluatorOfAllVehicles(self, callback_index: int) -> None:
+        self._arc_cost_cb = self._transit_callbacks[callback_index]
+
+    def AddDimension(
+        self,
+        callback_index: int,
+        slack_max: int,
+        capacity: int,
+        fix_start_cumul_to_zero: bool,
+        name: str,
+    ) -> None:
+        self._dimensions[name] = DimensionSpec(
+            name=name,
+            transit_cb=self._transit_callbacks[callback_index],
+            slack_max=slack_max,
+            capacity=capacity,
+            fix_start_cumul_to_zero=fix_start_cumul_to_zero,
+        )
+
+    def AddDimensionWithVehicleCapacity(
+        self,
+        callback_index: int,
+        slack_max: int,
+        vehicle_capacity: List[int],
+        fix_start_cumul_to_zero: bool,
+        name: str,
+    ) -> None:
+        self._dimensions[name] = DimensionSpec(
+            name=name,
+            unary_cb=self._unary_callbacks[callback_index],
+            slack_max=slack_max,
+            vehicle_capacity=list(vehicle_capacity),
+            fix_start_cumul_to_zero=fix_start_cumul_to_zero,
+        )
+
+    def GetDimensionOrDie(self, name: str) -> "RoutingDimension":
+        return RoutingDimension(self, name)
+
+    def AddPickupAndDelivery(self, pickup_index: Index, delivery_index: Index) -> None:
+        self._pickup_delivery.append(
+            PickupDeliveryPair(pickup_index, delivery_index)
+        )
+
+    def AddDisjunction(self, indices: Sequence[Index], penalty: int) -> None:
+        self._disjunctions.append(DisjunctionSpec(tuple(indices), penalty))
+
+    def VehicleVar(self, index: Index) -> "VehicleVarRef":
+        return VehicleVarRef(self, index)
+
+    def Start(self, vehicle: int) -> Index:
+        return self._manager.starts[vehicle]
+
+    def End(self, vehicle: int) -> Index:
+        return self._manager.ends[vehicle]
+
+    def IsEnd(self, index: Index) -> bool:
+        return index in self._manager.ends
+
+    def NextVar(self, index: Index) -> Index:
+        return index
+
+    def SolveWithParameters(
+        self, params: RoutingSearchParameters
+    ) -> Optional[RoutingSolution]:
+        return _VRPSolver(self).solve(params)
+
+
+class VehicleVarRef:
+    def __init__(self, model: RoutingModel, index: Index) -> None:
+        self._model = model
+        self._index = index
+
+    def SetValues(self, vehicles: Sequence[int]) -> None:
+        self._model._fixed_vehicle[self._index] = list(vehicles)
+
+
+class RoutingDimension:
+    def __init__(self, model: RoutingModel, name: str) -> None:
+        self._model = model
+        self._name = name
+
+    def _spec(self) -> DimensionSpec:
+        return self._model._dimensions[self._name]
+
+    def CumulVar(self, index: Index) -> "CumulVarRef":
+        return CumulVarRef(self._model, self._name, index)
+
+    def SetCumulVarSoftUpperBound(
+        self, index: Index, upper_bound: int, coefficient: int
+    ) -> None:
+        self._spec().soft_upper_bounds.append((index, upper_bound, coefficient))
+
+
+class CumulVarRef:
+    def __init__(self, model: RoutingModel, dim_name: str, index: Index) -> None:
+        self._model = model
+        self._dim_name = dim_name
+        self._index = index
+
+    def SetValue(self, value: int) -> None:
+        self._model._dimensions[self._dim_name].start_cumul[self._index] = value
+
+
+class _RouteState:
+    def __init__(self, routes: List[List[Node]], skipped: Set[Node]) -> None:
+        self.routes = routes
+        self.skipped = skipped
+
+
+class _VRPSolver:
+    def __init__(self, model: RoutingModel) -> None:
+        self._m = model
+        self._mgr = model._manager
+        self._v = self._mgr.num_vehicles
+        self._arc = model._arc_cost_cb
+        assert self._arc is not None
+
+    def solve(self, params: RoutingSearchParameters) -> Optional[RoutingSolution]:
+        state = self._initial_state()
+        if state is None:
+            return None
+
+        deadline = time.perf_counter() + params.time_limit_ms / 1000.0
+
+        if params.first_solution_strategy == RoutingModel.PARALLEL_CHEAPEST_INSERTION:
+            pci = self._parallel_cheapest_insertion(state, deadline)
+            if pci is not None:
+                state = pci
+
+        best_state = _RouteState(
+            routes=[list(r) for r in state.routes],
+            skipped=set(state.skipped),
+        )
+        best_cost = self._total_cost(best_state)
+
+        if params.local_search_metaheuristic == RoutingModel.GUIDED_LOCAL_SEARCH:
+            gls_state, gls_cost = self._guided_local_search(
+                best_state, best_cost, deadline
+            )
+            if gls_cost < best_cost:
+                best_state, best_cost = gls_state, gls_cost
+
+        if not self._is_feasible(best_state):
+            return None
+        return self._build_solution(best_state)
+
+    def _initial_state(self) -> Optional[_RouteState]:
+        routes: List[List[Node]] = [[] for _ in range(self._v)]
+        skipped: Set[Node] = set()
+        for node, vehicles in self._m._fixed_vehicle.items():
+            if len(vehicles) != 1:
+                continue
+            routes[vehicles[0]].append(node)
+        for v in range(self._v):
+            if not self._route_feasible(v, routes[v], skipped):
+                return None
+        return _RouteState(routes=routes, skipped=skipped)
+
+    def _optional_nodes(self) -> Set[Node]:
+        opt: Set[Node] = set()
+        for d in self._m._disjunctions:
+            opt.update(d.indices)
+        return opt
+
+    def _skip_penalty(self, node: Node) -> int:
+        for d in self._m._disjunctions:
+            if node in d.indices:
+                return d.penalty
+        return 0
+
+    def _is_mandatory(self, node: Node) -> bool:
+        if node in self._m._fixed_vehicle:
+            return True
+        return node not in self._optional_nodes()
+
+    def _parallel_cheapest_insertion(
+        self, state: _RouteState, deadline: float
+    ) -> Optional[_RouteState]:
+        pairs = list(self._m._pickup_delivery)
+        if not pairs:
+            return state
+
+        base_cost = self._total_cost(state)
+        for pair in pairs:
+            if time.perf_counter() >= deadline:
+                break
+            p, d = pair.pickup_index, pair.delivery_index
+            if p in state.skipped or self._node_in_routes(state, p):
+                continue
+
+            best_delta = self._skip_penalty(p) + self._skip_penalty(d)
+            best_skip = True
+            best_v = -1
+            best_pos_p = -1
+            best_pos_d = -1
+
+            for v in range(self._v):
+                if self._m._fixed_vehicle.get(p) and v not in self._m._fixed_vehicle[p]:
+                    continue
+                if self._m._fixed_vehicle.get(d) and v not in self._m._fixed_vehicle[d]:
+                    continue
+                route = state.routes[v]
+                n = len(route)
+                for pos_p in range(n + 1):
+                    for pos_d in range(pos_p + 1, n + 2):
+                        new_route = (
+                            route[:pos_p] + [p] + route[pos_p:pos_d] + [d] + route[pos_d:]
+                        )
+                        if not self._route_feasible(v, new_route, state.skipped):
+                            continue
+                        trial_routes = [list(r) for r in state.routes]
+                        trial_routes[v] = new_route
+                        trial = _RouteState(
+                            routes=trial_routes, skipped=set(state.skipped)
+                        )
+                        if not self._is_feasible(trial):
+                            continue
+                        delta = self._total_cost(trial) - base_cost
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_skip = False
+                            best_v = v
+                            best_pos_p = pos_p
+                            best_pos_d = pos_d
+
+            if best_skip:
+                state.skipped.add(p)
+                state.skipped.add(d)
+            else:
+                route = state.routes[best_v]
+                state.routes[best_v] = (
+                    route[:best_pos_p]
+                    + [p]
+                    + route[best_pos_p:best_pos_d]
+                    + [d]
+                    + route[best_pos_d:]
+                )
+            base_cost += best_delta
+
+        return state
+
+    def _guided_local_search(
+        self, state: _RouteState, init_cost: int, deadline: float
+    ) -> Tuple[_RouteState, int]:
+        best = _RouteState(
+            routes=[list(r) for r in state.routes], skipped=set(state.skipped)
+        )
+        best_cost = init_cost
+        current = _RouteState(
+            routes=[list(r) for r in state.routes], skipped=set(state.skipped)
+        )
+
+        guide: Dict[Tuple[Node, Node], int] = {}
+        stagnation = 0
+        max_iters = 200
+
+        iters = 0
+        while time.perf_counter() < deadline and iters < max_iters:
+            iters += 1
+            improved = False
+            for _ in range(16):
+                neighbor = self._random_neighbor(current)
+                if neighbor is None or not self._is_feasible(neighbor):
+                    continue
+                if self._guided_cost(neighbor, guide) < self._guided_cost(current, guide):
+                    current = neighbor
+                    improved = True
+                    real = self._total_cost(current)
+                    if real < best_cost:
+                        best = _RouteState(
+                            routes=[list(r) for r in current.routes],
+                            skipped=set(current.skipped),
+                        )
+                        best_cost = real
+                        stagnation = 0
+
+            if not improved:
+                stagnation += 1
+                if stagnation >= 40:
+                    self._update_penalties(guide, current)
+                    stagnation = 0
+
+        return best, best_cost
+
+    def _update_penalties(
+        self, guide: Dict[Tuple[Node, Node], int], state: _RouteState
+    ) -> None:
+        for v in range(self._v):
+            path = self._full_path(v, state.routes[v])
+            for i in range(len(path) - 1):
+                key = (path[i], path[i + 1])
+                guide[key] = guide.get(key, 0) + 1
+
+    def _guided_cost(
+        self, state: _RouteState, guide: Dict[Tuple[Node, Node], int]
+    ) -> int:
+        base = self._total_cost(state)
+        extra = 0
+        for v in range(self._v):
+            path = self._full_path(v, state.routes[v])
+            for i in range(len(path) - 1):
+                extra += guide.get((path[i], path[i + 1]), 0) * 4
+        return base + extra
+
+    def _random_neighbor(self, state: _RouteState) -> Optional[_RouteState]:
+        op = self._m._rng.randint(0, 5)
+        if op == 0:
+            return self._relocate_node(state)
+        if op == 1:
+            return self._swap_nodes(state)
+        if op == 2:
+            return self._two_opt(state)
+        if op == 3:
+            return self._toggle_skip_pair(state)
+        if op == 4:
+            return self._relocate_pair(state)
+        return self._relocate_pair(state)
+
+    def _relocate_node(self, state: _RouteState) -> Optional[_RouteState]:
+        for pair in self._m._pickup_delivery:
+            if self._node_in_routes(state, pair.pickup_index):
+                return self._relocate_pair(state)
+        return None
+
+    def _relocate_pair(self, state: _RouteState) -> Optional[_RouteState]:
+        if not self._m._pickup_delivery:
+            return None
+        pair = self._m._rng.choice(self._m._pickup_delivery)
+        p, d = pair.pickup_index, pair.delivery_index
+        if p in state.skipped:
+            return None
+        trial = _RouteState(
+            routes=[list(r) for r in state.routes], skipped=set(state.skipped)
+        )
+        for route in trial.routes:
+            if p in route:
+                route.remove(p)
+            if d in route:
+                route.remove(d)
+        v_to = self._m._rng.randrange(self._v)
+        route = trial.routes[v_to]
+        pos_p = self._m._rng.randrange(len(route) + 1)
+        route.insert(pos_p, p)
+        pos_d = self._m._rng.randrange(pos_p + 1, len(route) + 1)
+        route.insert(pos_d, d)
+        return trial
+
+    def _swap_nodes(self, state: _RouteState) -> Optional[_RouteState]:
+        trial = _RouteState(
+            routes=[list(r) for r in state.routes], skipped=set(state.skipped)
+        )
+        movable: List[Tuple[int, int]] = []
+        for v, route in enumerate(trial.routes):
+            for i, n in enumerate(route):
+                if not self._is_mandatory(n):
+                    movable.append((v, i))
+        if len(movable) < 2:
+            return None
+        (v1, i1), (v2, i2) = self._m._rng.sample(movable, 2)
+        trial.routes[v1][i1], trial.routes[v2][i2] = (
+            trial.routes[v2][i2],
+            trial.routes[v1][i1],
+        )
+        return trial
+
+    def _two_opt(self, state: _RouteState) -> Optional[_RouteState]:
+        v = self._m._rng.randrange(self._v)
+        route = state.routes[v]
+        if len(route) < 2:
+            return None
+        i, j = sorted(self._m._rng.sample(range(len(route)), 2))
+        trial = _RouteState(
+            routes=[list(r) for r in state.routes], skipped=set(state.skipped)
+        )
+        trial.routes[v] = route[:i] + list(reversed(route[i : j + 1])) + route[j + 1 :]
+        return trial
+
+    def _toggle_skip_pair(self, state: _RouteState) -> Optional[_RouteState]:
+        if not self._m._pickup_delivery:
+            return None
+        pair = self._m._rng.choice(self._m._pickup_delivery)
+        p, d = pair.pickup_index, pair.delivery_index
+        trial = _RouteState(
+            routes=[list(r) for r in state.routes], skipped=set(state.skipped)
+        )
+        if p in state.skipped:
+            trial.skipped.discard(p)
+            trial.skipped.discard(d)
+            v = self._m._rng.randrange(self._v)
+            trial.routes[v].extend([p, d])
+        else:
+            for route in trial.routes:
+                if p in route:
+                    route.remove(p)
+                if d in route:
+                    route.remove(d)
+            trial.skipped.add(p)
+            trial.skipped.add(d)
+        return trial
+
+    def _node_in_routes(self, state: _RouteState, node: Node) -> bool:
+        return any(node in r for r in state.routes)
+
+    def _full_path(self, vehicle: int, intermediates: List[Node]) -> List[Node]:
+        return [self._mgr.starts[vehicle]] + intermediates + [self._mgr.ends[vehicle]]
+
+    def _dimension_transit(self, spec: DimensionSpec, a: Node, b: Node) -> int:
+        if spec.transit_cb is None:
+            return 0
+        return spec.transit_cb(a, b)
+
+    def _dimension_unary(self, spec: DimensionSpec, node: Node) -> int:
+        if spec.unary_cb is None:
+            return 0
+        return spec.unary_cb(node)
+
+    def _evaluate_route(
+        self, vehicle: int, intermediates: List[Node]
+    ) -> Optional[Dict[str, List[int]]]:
+        path = self._full_path(vehicle, intermediates)
+        dim_cumuls: Dict[str, List[int]] = {}
+        for name, spec in self._m._dimensions.items():
+            start_idx = self._mgr.starts[vehicle]
+            start_val = spec.start_cumul.get(start_idx, 0)
+            cumuls = [start_val]
+            cur = start_val
+            for i in range(1, len(path)):
+                cur += self._dimension_transit(spec, path[i - 1], path[i])
+                cur += self._dimension_unary(spec, path[i])
+                cumuls.append(cur)
+            cap = (
+                spec.vehicle_capacity[vehicle]
+                if spec.vehicle_capacity is not None
+                else spec.capacity
+            )
+            if cap > 0:
+                for c in cumuls:
+                    if c < 0 or c > cap:
+                        return None
+            dim_cumuls[name] = cumuls
+        return dim_cumuls
+
+    def _route_feasible(
+        self, vehicle: int, intermediates: List[Node], skipped: Set[Node]
+    ) -> bool:
+        for n in intermediates:
+            if n in self._m._fixed_vehicle:
+                if vehicle not in self._m._fixed_vehicle[n]:
+                    return False
+        return self._evaluate_route(vehicle, intermediates) is not None
+
+    def _is_feasible(self, state: _RouteState) -> bool:
+        visited: Dict[Node, int] = {}
+        for v, route in enumerate(state.routes):
+            if not self._route_feasible(v, route, state.skipped):
+                return False
+            for n in route:
+                if n in visited:
+                    return False
+                visited[n] = v
+        for n in state.skipped:
+            if self._is_mandatory(n):
+                return False
+        for pair in self._m._pickup_delivery:
+            p, d = pair.pickup_index, pair.delivery_index
+            p_vis = p in visited
+            d_vis = d in visited
+            if p in state.skipped or d in state.skipped:
+                if p_vis or d_vis:
+                    return False
+                continue
+            if p_vis != d_vis:
+                return False
+            if p_vis:
+                if visited[p] != visited[d]:
+                    return False
+                rv = visited[p]
+                r = state.routes[rv]
+                if r.index(p) >= r.index(d):
+                    return False
+                if "Time" in self._m._dimensions:
+                    ev = self._evaluate_route(rv, r)
+                    if ev is None:
+                        return False
+                    path = self._full_path(rv, r)
+                    if ev["Time"][path.index(p)] > ev["Time"][path.index(d)]:
+                        return False
+        for n, vehicles in self._m._fixed_vehicle.items():
+            if n in visited and visited[n] not in vehicles:
+                return False
+            if n not in visited and n not in state.skipped:
+                return False
+        return True
+
+    def _soft_penalty(self, state: _RouteState) -> int:
+        penalty = 0
+        for v, route in enumerate(state.routes):
+            path = self._full_path(v, route)
+            for name, spec in self._m._dimensions.items():
+                ev = self._evaluate_route(v, route)
+                if ev is None:
+                    continue
+                cumuls = ev[name]
+                for idx, ub, coeff in spec.soft_upper_bounds:
+                    if idx not in path:
+                        continue
+                    penalty += coeff * max(0, cumuls[path.index(idx)] - ub)
+        return penalty
+
+    def _skip_penalties_total(self, state: _RouteState) -> int:
+        total = 0
+        counted: Set[Node] = set()
+        for node in state.skipped:
+            if node in counted:
+                continue
+            total += self._skip_penalty(node)
+            counted.add(node)
+        return total
+
+    def _arc_cost_total(self, state: _RouteState) -> int:
+        total = 0
+        for v, route in enumerate(state.routes):
+            path = self._full_path(v, route)
+            for i in range(len(path) - 1):
+                total += self._arc(path[i], path[i + 1])
+        return total
+
+    def _total_cost(self, state: _RouteState) -> int:
+        return (
+            self._arc_cost_total(state)
+            + self._soft_penalty(state)
+            + self._skip_penalties_total(state)
+        )
+
+    def _build_solution(self, state: _RouteState) -> RoutingSolution:
+        next_map: Dict[Index, Index] = {}
+        for v in range(self._v):
+            path = self._full_path(v, state.routes[v])
+            for i in range(len(path) - 1):
+                next_map[path[i]] = path[i + 1]
+        return RoutingSolution(next_map)
+
+
+# Delivery solver
 
 class VRPOrToolsSolver(Solver):
 
     method_name = "VRPOrTools"
 
-    # Số bước tối đa giữa hai lần replan dù không có sự kiện
     REPLAN_PERIOD = 40
-    # Cooldown khi chỉ có sự kiện đơn mới xuất hiện
     NEW_ORDER_REPLAN_COOLDOWN = 6
-    # Số bước kẹt liên tiếp tối đa trước khi replan
     STUCK_LIMIT = 3
-    # Giới hạn số đơn unpicked đưa vào một lần solve
     MAX_UNPICKED_FOR_SOLVE = 80
 
     def __init__(self, env: DeliveryEnv):
@@ -72,7 +700,6 @@ class VRPOrToolsSolver(Solver):
         self.rows: int = len(self.grid)
         self.cols: int = len(self.grid[0]) if self.rows else 0
 
-        # BFS all-pairs
         self._dist: Dict[Position, Dict[Position, int]] = {}
         self._step: Dict[Position, Dict[Position, Move]] = {}
         self._precompute_shortest_paths()
@@ -82,9 +709,7 @@ class VRPOrToolsSolver(Solver):
         self._last_position: Dict[int, Position] = {}
         self._stuck_counter: Dict[int, int] = {i: 0 for i in range(self.C)}
 
-    # Precompute BFS shortest paths.
     def _precompute_shortest_paths(self) -> None:
-        
         free_cells: List[Position] = [
             (r, c)
             for r in range(self.rows)
@@ -141,7 +766,6 @@ class VRPOrToolsSolver(Solver):
             return "S"
         return self._step.get(a, {}).get(b, "S")
 
-    # Helpers
     @staticmethod
     def _bag_weight(shipper: Shipper, orders: Dict[int, Order]) -> float:
         return sum(orders[oid].w for oid in shipper.bag if oid in orders)
@@ -154,19 +778,16 @@ class VRPOrToolsSolver(Solver):
     def _late_floor_reward(order: Order) -> float:
         return BETA[order.p] * r_base(order.w)
 
-    # Greedy fallback
     def _greedy_replan(
         self,
         obs: dict,
         unpicked: List[Order],
         bag_orders: Dict[int, List[Order]],
     ) -> None:
-        
         shippers: List[Shipper] = obs["shippers"]
         orders: Dict[int, Order] = obs["orders"]
         reserved: set = set()
 
-        # Đầu tiên đặt lịch giao những đơn đã trong bag (sort theo deadline)
         for s in shippers:
             self.plans[s.id] = []
             in_bag = sorted(bag_orders.get(s.id, []), key=lambda o: (o.et, -o.p, o.id))
@@ -176,13 +797,11 @@ class VRPOrToolsSolver(Solver):
         if not unpicked:
             return
 
-        # Với mỗi shipper, chọn đơn unpicked có "lợi / chi phí" lớn nhất
         for s in shippers:
             current_pos = s.position
             current_bag_count = len(s.bag)
             current_bag_weight = self._bag_weight(s, orders)
 
-            # Cho phép gán nhiều đơn liên tiếp nếu còn slot
             for _ in range(s.K_max - current_bag_count):
                 best: Optional[Order] = None
                 best_score = -1.0
@@ -212,7 +831,6 @@ class VRPOrToolsSolver(Solver):
                 current_bag_count += 1
                 current_bag_weight += best.w
 
-    # VRP replan với OR-Tools
     def _replan(self, obs: dict) -> None:
         orders: Dict[int, Order] = obs["orders"]
         shippers: List[Shipper] = obs["shippers"]
@@ -235,14 +853,9 @@ class VRPOrToolsSolver(Solver):
                 self.plans[s.id] = []
             return
 
-        # Sắp xếp ưu tiên: priority cao trước, deadline gần trước
         unpicked.sort(key=lambda o: (-o.p, o.et, o.id))
         if len(unpicked) > self.MAX_UNPICKED_FOR_SOLVE:
             unpicked = unpicked[: self.MAX_UNPICKED_FOR_SOLVE]
-        
-        if not _HAS_ORTOOLS:
-            self._greedy_replan(obs, unpicked, bag_orders)
-            return
 
         locations: List[Position] = []
         for s in shippers:
@@ -263,18 +876,15 @@ class VRPOrToolsSolver(Solver):
                 locations.append((o.ex, o.ey))
 
         n_nodes = len(locations)
-
         starts = list(range(C))
         ends = list(range(C, 2 * C))
 
-        manager = pywrapcp.RoutingIndexManager(n_nodes, C, starts, ends)
-        routing = pywrapcp.RoutingModel(manager)
+        manager = RoutingIndexManager(n_nodes, C, starts, ends)
+        routing = RoutingModel(manager)
 
-        # Distance / arc cost
         def transit_cb(from_index: int, to_index: int) -> int:
             from_node = manager.IndexToNode(from_index)
             to_node = manager.IndexToNode(to_index)
-            # Đi tới end node ảo: miễn phí.
             if C <= to_node < 2 * C:
                 return 0
             return self._distance(locations[from_node], locations[to_node])
@@ -282,7 +892,6 @@ class VRPOrToolsSolver(Solver):
         transit_idx = routing.RegisterTransitCallback(transit_cb)
         routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
 
-        # Time dimension
         horizon = max(self.T + 50, t_now + 200)
 
         def time_cb(from_index: int, to_index: int) -> int:
@@ -315,7 +924,6 @@ class VRPOrToolsSolver(Solver):
             ub = max(t_now, min(o.et, horizon - 1))
             time_dim.SetCumulVarSoftUpperBound(d_idx, ub, _deadline_coeff(o))
 
-        # Count capacity (số đơn trong bag)
         def count_cb(from_index: int) -> int:
             n = manager.IndexToNode(from_index)
             if n < 2 * C:
@@ -337,7 +945,6 @@ class VRPOrToolsSolver(Solver):
         for v, s in enumerate(shippers):
             count_dim.CumulVar(routing.Start(v)).SetValue(len(s.bag))
 
-        # Weight capacity
         def weight_cb(from_index: int) -> int:
             n = manager.IndexToNode(from_index)
             if n < 2 * C:
@@ -364,39 +971,26 @@ class VRPOrToolsSolver(Solver):
             w_bag_int = int(round(self._bag_weight(s, orders) * WEIGHT_SCALE))
             weight_dim.CumulVar(routing.Start(v)).SetValue(w_bag_int)
 
-        # Pickup-Delivery + Disjunction
-        solver = routing.solver()
         for i, o in enumerate(unpicked):
             p_node = unpicked_start + 2 * i
             d_node = p_node + 1
             p_idx = manager.NodeToIndex(p_node)
             d_idx = manager.NodeToIndex(d_node)
-
             routing.AddPickupAndDelivery(p_idx, d_idx)
-            solver.Add(routing.VehicleVar(p_idx) == routing.VehicleVar(d_idx))
-            solver.Add(time_dim.CumulVar(p_idx) <= time_dim.CumulVar(d_idx))
-
             potential = int(round(self._potential_reward(o) * REWARD_SCALE))
             routing.AddDisjunction([p_idx], max(potential, 1))
             routing.AddDisjunction([d_idx], max(potential, 1))
 
-        # Bag delivery: ép thuộc carrier hiện tại
         for offset, (sid, o) in enumerate(bag_entries):
             d_node = bag_start + offset
             d_idx = manager.NodeToIndex(d_node)
             routing.VehicleVar(d_idx).SetValues([sid])
-            # Bỏ đơn đang ôm trên tay => phạt rất nặng.
             potential = int(round(self._potential_reward(o) * REWARD_SCALE)) * 10
             routing.AddDisjunction([d_idx], max(potential, 1))
 
-        # Search params (time budget thích nghi)
-        params = pywrapcp.DefaultRoutingSearchParameters()
-        params.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
-        )
-        params.local_search_metaheuristic = (
-            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        )
+        params = default_routing_search_parameters()
+        params.first_solution_strategy = RoutingModel.PARALLEL_CHEAPEST_INSERTION
+        params.local_search_metaheuristic = RoutingModel.GUIDED_LOCAL_SEARCH
         n_orders = len(unpicked) + len(bag_entries)
         if n_orders <= 4:
             time_limit_ms = 150
@@ -410,22 +1004,13 @@ class VRPOrToolsSolver(Solver):
             time_limit_ms = 1800
         else:
             time_limit_ms = 2300
-        params.time_limit.seconds = time_limit_ms // 1000
-        params.time_limit.nanos = (time_limit_ms % 1000) * 1_000_000
-        # Dừng sớm khi không cải tiến.
-        try:
-            params.lns_time_limit.seconds = 0
-            params.lns_time_limit.nanos = 100_000_000
-        except Exception:
-            pass
+        params.time_limit_ms = time_limit_ms
 
         solution = routing.SolveWithParameters(params)
         if solution is None:
-            # OR-Tools không tìm được nghiệm thì dùng greedy
             self._greedy_replan(obs, unpicked, bag_orders)
             return
 
-        # Trích xuất plan
         for v in range(C):
             new_plan: List[PlanStep] = []
             idx = routing.Start(v)
@@ -447,9 +1032,7 @@ class VRPOrToolsSolver(Solver):
                     new_plan.append((o.ex, o.ey, "D", o.id))
             self.plans[v] = new_plan
 
-    # Pop những bước đã hoàn thành hoặc không còn hợp lệ
     def _advance_plans(self, obs: dict) -> bool:
-        
         orders: Dict[int, Order] = obs["orders"]
         invalid = False
 
@@ -460,29 +1043,25 @@ class VRPOrToolsSolver(Solver):
                 o = orders.get(oid)
                 if op_t == "P":
                     if oid in s.bag:
-                        # Đã nhặt thành công
                         plan.pop(0)
                         continue
                     if o is None or o.delivered or (o.picked and o.carrier != s.id):
-                        # Đơn không còn hoặc bị xe khác nhặt
                         plan.pop(0)
                         invalid = True
                         continue
                     break
-                else:  # "D"
+                else:
                     if o is None or o.delivered:
                         plan.pop(0)
                         continue
                     if oid not in s.bag:
-                        # Đơn đáng lẽ trong bag nhưng không có → bất nhất
                         plan.pop(0)
                         invalid = True
                         continue
                     break
 
         return invalid
-    
-    # Quyết định có replan hay không
+
     def _needs_replan(self, obs: dict, invalid_after_advance: bool) -> bool:
         t_now: int = int(obs.get("t", 0))
         orders: Dict[int, Order] = obs["orders"]
@@ -498,32 +1077,26 @@ class VRPOrToolsSolver(Solver):
         if invalid_after_advance:
             return True
 
-        # Bất kỳ shipper nào trống lịch mà còn việc khả thi
         for s in shippers:
             if not self.plans[s.id]:
-                # Còn unpicked đơn shipper có thể chở, hoặc đang giữ đơn
                 if s.bag:
                     return True
                 if has_unpicked:
                     return True
 
-        # Có đơn mới (đã qua cooldown)
         if obs.get("new_order_ids"):
             if t_now - self._last_replan_t >= self.NEW_ORDER_REPLAN_COOLDOWN:
                 return True
 
-        # Có shipper kẹt nhiều bước
         for s in shippers:
             if self._stuck_counter.get(s.id, 0) >= self.STUCK_LIMIT and self.plans[s.id]:
                 return True
 
-        # Plan stale
         if t_now - self._last_replan_t >= self.REPLAN_PERIOD:
             return True
 
         return False
 
-    # Sinh action cho một shipper dựa trên plan đầu tiên
     def _action_for(self, shipper: Shipper) -> Tuple[Move, int]:
         plan = self.plans[shipper.id]
         if not plan:
@@ -533,42 +1106,33 @@ class VRPOrToolsSolver(Solver):
         target: Position = (target_r, target_c)
 
         if shipper.position == target:
-            # Đã ở đúng ô thì thực hiện op tại chỗ
             return ("S", 1 if op_t == "P" else 2)
 
         move = self._next_move(shipper.position, target)
         if op_t == "D":
-            # op=2 sẽ chỉ giao nếu trùng đích sau bước
             return (move, 2)
 
         return (move, 0)
 
-    # Main loop
     def run(self) -> dict:
         start_time = time.time()
         obs = self.env.reset()
 
         while not obs.get("done", False):
-            # Cập nhật kế hoạch dựa trên trạng thái mới nhất
             invalid = self._advance_plans(obs)
 
-            # Replan nếu cần.
             if self._needs_replan(obs, invalid):
                 self._replan(obs)
                 self._last_replan_t = int(obs["t"])
-                # Reset stuck counter sau replan
                 self._stuck_counter = {s.id: 0 for s in obs["shippers"]}
 
-            # Sinh action
             actions: Dict[int, Tuple[Move, int]] = {}
             for s in obs["shippers"]:
                 actions[s.id] = self._action_for(s)
 
-            # Step môi trường
             prev_positions = {s.id: s.position for s in obs["shippers"]}
             obs, _, done, _ = self.env.step(actions)
 
-            # Cập nhật stuck-counter (shipper không di chuyển dù không phải đang đứng ở target để pickup/deliver)
             for s in obs["shippers"]:
                 prev = prev_positions.get(s.id)
                 if prev is None:

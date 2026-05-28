@@ -44,6 +44,7 @@ def load_solver_class(class_name: str, file_name: str):
     if spec is None or spec.loader is None:
         sys.exit(f"[ERROR] Không thể load module {file_name}.")
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     solver_cls = getattr(mod, class_name, None)
     if solver_cls is None:
