@@ -15,7 +15,14 @@ from env import (
     valid_next_pos,
 )
 from solvers.solver import Solver
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+try:
+    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+    _HAS_ORTOOLS = True
+except Exception:
+    _HAS_ORTOOLS = False
+
 
 Move = str
 Position = Tuple[int, int]
@@ -232,6 +239,10 @@ class VRPOrToolsSolver(Solver):
         unpicked.sort(key=lambda o: (-o.p, o.et, o.id))
         if len(unpicked) > self.MAX_UNPICKED_FOR_SOLVE:
             unpicked = unpicked[: self.MAX_UNPICKED_FOR_SOLVE]
+        
+        if not _HAS_ORTOOLS:
+            self._greedy_replan(obs, unpicked, bag_orders)
+            return
 
         locations: List[Position] = []
         for s in shippers:
